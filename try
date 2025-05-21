@@ -263,3 +263,300 @@ if __name__ == "__main__":
             servo_exit_pwm.stop()
         GPIO.cleanup()
         print("GPIO Cleaned. Exited.")
+////////////////////////////////////////////////////////////////////////////
+
+    import RPi.GPIO as GPIO
+import time
+from RPLCD.gpio import CharLCD
+
+# --- Pin Definitions (BCM Mode) ---
+# LCD Pins (Matches your image)
+LCD_RS_PIN = 7    # Physical 26
+LCD_E_PIN = 8     # Physical 24
+LCD_D4_PIN = 25   # Physical 22
+LCD_D5_PIN = 24   # Physical 18
+LCD_D6_PIN = 23   # Physical 16
+LCD_D7_PIN = 12   # Physical 32
+
+# IR Sensor Pins (Matches your image)
+IR_ENTRY_PIN = 27 # Physical 13
+IR_EXIT_PIN = 22  # Physical 15
+
+# Servo Pins (Matches your image)
+SERVO_ENTRY_PIN = 17 # GPIO17 (Physical 11)
+SERVO_EXIT_PIN = 4   # GPIO4  (Physical 7)
+
+# Ultrasonic Sensor Pins (TRIG=Output, ECHO=Input)
+# Make sure these BCM numbers match exactly what you have wired.
+US_SENSORS = [
+    {"name": "Slot 1", "trig": 5,  "echo": 6},    # Physical TRIG=29, ECHO=31
+    {"name": "Slot 2", "trig": 19, "echo": 26},   # Physical TRIG=35, ECHO=37
+    {"name": "Slot 3", "trig": 20, "echo": 21},   # Physical TRIG=38, ECHO=40
+    {"name": "Slot 4", "trig": 16, "echo": 13},   # Physical TRIG=36, ECHO=33
+    {"name": "Slot 5", "trig": 10, "echo": 9},    # Physical TRIG=19(MOSI), ECHO=21(MISO)
+    {"name": "Slot 6", "trig": 11, "echo": 18}    # Physical TRIG=23(SCLK), ECHO=12(PCM_CLK) <--- CORRECTED ECHO PIN FOR SLOT 6
+]
+TOTAL_PARKING_SPOTS = len(US_SENSORS)
+
+# --- Configuration ---
+CAR_PRESENT_THRESHOLD_CM = 30
+SERVO_FREQUENCY = 50
+SERVO_CLOSED_ANGLE = 0
+SERVO_OPEN_ANGLE = 90
+SERVO_MOVE_DELAY = 1.0
+GATE_OPEN_DURATION = 3.0
+US_POLLING_INTERVAL = 1.0
+IR_POLLING_INTERVAL = 0.1
+
+# --- Global Variables ---
+lcd = None
+lcd_ready = False
+servo_entry_pwm = None
+servo_exit_pwm = None
+occupied_spots_status = [False] * TOTAL_PARKING_SPOTS
+previous_occupied_spots_status = [False] * TOTAL_PARKING_SPOTS # For tracking changes
+available_spots_count = TOTAL_PARKING_SPOTS
+last_us_poll_time = 0
+car_at_entry_flag = False
+car_at_exit_flag = False
+
+# --- LCD Setup ---
+def setup_lcd():
+    global lcd, lcd_ready
+    try:
+        lcd = CharLCD(
+            numbering_mode=GPIO.BCM, cols=16, rows=2,
+            pin_rs=LCD_RS_PIN, pin_e=LCD_E_PIN,
+            pins_data=[LCD_D4_PIN, LCD_D5_PIN, LCD_D6_PIN, LCD_D7_PIN],
+            charmap='A00', auto_linebreaks=True
+        )
+        lcd.clear()
+        lcd_ready = True
+        print("LCD Initialized Successfully.")
+        lcd_display("Parking System", "Initializing...")
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize LCD: {e}")
+        lcd_ready = False
+
+def lcd_display(line1, line2=""):
+    if not lcd_ready: return
+    try:
+        lcd.clear()
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string(line1[:16])
+        if line2:
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string(line2[:16])
+    except Exception as e:
+        print(f"[ERROR] LCD display error: {e}")
+
+# --- GPIO Setup ---
+def setup_gpio():
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+
+    # IR Sensors
+    GPIO.setup(IR_ENTRY_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(IR_EXIT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    # Ultrasonic Sensors
+    for sensor in US_SENSORS:
+        GPIO.setup(sensor["trig"], GPIO.OUT)
+        GPIO.setup(sensor["echo"], GPIO.IN)
+        GPIO.output(sensor["trig"], False)
+
+    # Servos
+    GPIO.setup(SERVO_ENTRY_PIN, GPIO.OUT)
+    GPIO.setup(SERVO_EXIT_PIN, GPIO.OUT)
+    print("GPIO Initialized.")
+
+# --- Servo Control ---
+def setup_servos():
+    global servo_entry_pwm, servo_exit_pwm
+    try:
+        servo_entry_pwm = GPIO.PWM(SERVO_ENTRY_PIN, SERVO_FREQUENCY)
+        servo_exit_pwm = GPIO.PWM(SERVO_EXIT_PIN, SERVO_FREQUENCY)
+        servo_entry_pwm.start(0)
+        servo_exit_pwm.start(0)
+        set_servo_angle(servo_entry_pwm, SERVO_CLOSED_ANGLE, "Entry Initial")
+        set_servo_angle(servo_exit_pwm, SERVO_CLOSED_ANGLE, "Exit Initial")
+        print("Servos Initialized and Closed.")
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize servos: {e}")
+        print("Make sure you are using PWM capable GPIO pins and they are not in use by other hardware overlays (like SPI for some pins if not configured for GPIO).")
+
+
+def set_servo_angle(servo_pwm, angle, gate_name_debug=""): # Added gate_name_debug for better logging
+    if servo_pwm is None:
+        #print(f"Servo PWM for {gate_name_debug} is None, cannot set angle.")
+        return
+    duty = (angle / 18.0) + 2.0
+    # print(f"Setting {gate_name_debug} servo to angle {angle} with duty {duty:.2f}") # Debug
+    servo_pwm.ChangeDutyCycle(duty)
+    time.sleep(SERVO_MOVE_DELAY)
+    servo_pwm.ChangeDutyCycle(0)
+
+def open_gate(servo_pwm, gate_name):
+    print(f"Opening {gate_name} gate...")
+    lcd_display(f"{gate_name} Gate", "Opening...")
+    set_servo_angle(servo_pwm, SERVO_OPEN_ANGLE, gate_name)
+    print(f"{gate_name} gate OPEN.")
+
+def close_gate(servo_pwm, gate_name):
+    print(f"Closing {gate_name} gate...")
+    lcd_display(f"{gate_name} Gate", "Closing...")
+    set_servo_angle(servo_pwm, SERVO_CLOSED_ANGLE, gate_name)
+    print(f"{gate_name} gate CLOSED.")
+
+# --- Sensor Functions ---
+def read_ir_sensor(pin):
+    return GPIO.input(pin) == GPIO.LOW
+
+def measure_distance(trig_pin, echo_pin):
+    # Ensure Trig pin is low
+    GPIO.output(trig_pin, False)
+    time.sleep(0.01) # Allow pin to settle, can be shorter
+
+    # Send a 10us pulse to Trig
+    GPIO.output(trig_pin, True)
+    time.sleep(0.00001) # 10 microseconds
+    GPIO.output(trig_pin, False)
+
+    pulse_start_time = time.time()
+    pulse_end_time = time.time()
+    timeout_limit = 0.1 # 100ms for timeout
+
+    # Save StartTime
+    # Loop until echo pin is HIGH or timeout
+    start_loop_time = time.time()
+    while GPIO.input(echo_pin) == 0:
+        pulse_start_time = time.time()
+        if pulse_start_time - start_loop_time > timeout_limit:
+            # print(f"Timeout waiting for ECHO pulse to start (TRIG:{trig_pin}, ECHO:{echo_pin})")
+            return float('inf') # Indicate timeout
+
+    # Save time of arrival
+    # Loop until echo pin is LOW or timeout
+    start_loop_time = time.time() # Reset for this loop
+    while GPIO.input(echo_pin) == 1:
+        pulse_end_time = time.time()
+        if pulse_end_time - start_loop_time > timeout_limit:
+            # print(f"Timeout waiting for ECHO pulse to end (TRIG:{trig_pin}, ECHO:{echo_pin})")
+            return float('inf') # Indicate timeout
+
+    pulse_duration = pulse_end_time - pulse_start_time
+    # Speed of sound is approx 343m/s or 34300cm/s
+    # Distance = (Time * SpeedOfSound) / 2 (because pulse travels there and back)
+    distance = (pulse_duration * 34300) / 2
+
+    if distance < 0: # Should not happen, but a safeguard
+        return float('inf')
+    return distance
+
+# --- Main Logic --- (Using your previously modified version for slot status prints)
+def update_parking_status():
+    global occupied_spots_status, previous_occupied_spots_status, available_spots_count, last_us_poll_time
+
+    if time.time() - last_us_poll_time < US_POLLING_INTERVAL:
+        return
+
+    new_occupied_count = 0
+    changed_slots = False
+
+    for i, sensor_info in enumerate(US_SENSORS):
+        dist = measure_distance(sensor_info["trig"], sensor_info["echo"])
+        current_spot_is_occupied = (dist < CAR_PRESENT_THRESHOLD_CM)
+
+        if current_spot_is_occupied != previous_occupied_spots_status[i]:
+            changed_slots = True
+            if current_spot_is_occupied:
+                print(f"🚗 Parking {sensor_info['name']} is now OCCUPIED. (Distance: {dist:.1f} cm)")
+            else:
+                print(f"✅ Parking {sensor_info['name']} is now EMPTY. (Distance: {dist:.1f} cm)")
+        
+        occupied_spots_status[i] = current_spot_is_occupied
+        if current_spot_is_occupied:
+            new_occupied_count += 1
+    
+    available_spots_count = TOTAL_PARKING_SPOTS - new_occupied_count
+    
+    if changed_slots or (time.time() - last_us_poll_time >= US_POLLING_INTERVAL * 1.5) : # Ensure previous_status updates
+        previous_occupied_spots_status = list(occupied_spots_status)
+
+    last_us_poll_time = time.time()
+
+def display_main_status():
+    global available_spots_count
+    if car_at_entry_flag or car_at_exit_flag:
+        return
+
+    if available_spots_count == TOTAL_PARKING_SPOTS:
+        lcd_display("Parking Empty", f"{available_spots_count} Free Spots")
+    elif available_spots_count > 0:
+        lcd_display("Spots Available", f"{available_spots_count} Free")
+    else:
+        lcd_display("Parking Full!", "No Spots Free")
+
+def main_loop():
+    global car_at_entry_flag, car_at_exit_flag, available_spots_count
+
+    entry_ir_active = read_ir_sensor(IR_ENTRY_PIN)
+    exit_ir_active = read_ir_sensor(IR_EXIT_PIN)
+
+    if entry_ir_active and not car_at_entry_flag:
+        if available_spots_count > 0:
+            car_at_entry_flag = True
+            open_gate(servo_entry_pwm, "Entry")
+            lcd_display("Car Entering", "Welcome!")
+            time.sleep(GATE_OPEN_DURATION)
+            close_gate(servo_entry_pwm, "Entry")
+            car_at_entry_flag = False
+        else:
+            print("Entry denied: Parking is full.")
+            lcd_display("Parking Full!", "Entry Denied")
+            time.sleep(2)
+
+    if exit_ir_active and not car_at_exit_flag:
+        car_at_exit_flag = True
+        open_gate(servo_exit_pwm, "Exit")
+        lcd_display("Car Leaving", "Goodbye!")
+        time.sleep(GATE_OPEN_DURATION)
+        close_gate(servo_exit_pwm, "Exit")
+        car_at_exit_flag = False
+
+    update_parking_status()
+    display_main_status()
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    try:
+        setup_gpio()
+        setup_lcd() # Call after GPIO.setmode
+        setup_servos()
+
+        if lcd_ready:
+            lcd_display("System Ready", f"{available_spots_count} Spots Free")
+        else:
+            print("System Ready (LCD not working). Available spots: ", available_spots_count)
+        time.sleep(2)
+
+        while True:
+            main_loop()
+            time.sleep(IR_POLLING_INTERVAL) # Main loop polling interval
+
+    except KeyboardInterrupt:
+        print("\nExiting Program...")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    finally:
+        print("Cleaning up...")
+        if lcd_ready and lcd: # Check if lcd object exists
+            lcd_display("System", "Shutting Down")
+            time.sleep(1)
+            lcd.clear()
+        if servo_entry_pwm:
+            servo_entry_pwm.stop()
+        if servo_exit_pwm:
+            servo_exit_pwm.stop()
+        GPIO.cleanup()
+        print("GPIO Cleaned. Exited.")
